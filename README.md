@@ -28,4 +28,3 @@ this program is to send four cyclic messages out on to the CAN bus. These
 messages have IDs ranging from 0x0C0 to 0x0C3. These messages will be sent out
 one at a time every 1200 milliseconds. Once all messages have been sent,
 transmission will begin again with message 0x0C0.
-
