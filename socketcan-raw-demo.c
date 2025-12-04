@@ -26,13 +26,11 @@ THE SOFTWARE.
 Raw Interface Demo
 
 This program demonstrates reading and writing to a CAN bus using SocketCAN's
-Raw interface. The intended behavior of this program is to read in any CAN
+raw interface. The intended behavior of this program is to read in any CAN
 message from the bus, add one to the value of each byte in the received
-message, and then write that message back out on to the bus with the message ID
+message, and then write that message back out to the bus with the message ID
 defined by the macro MSGID.
 */
-
-#include "util.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -40,210 +38,221 @@ defined by the macro MSGID.
 #include <stdlib.h>
 #include <string.h>
 
-#include <fcntl.h>
 #include <unistd.h>
+#include <error.h>
+#include <getopt.h>
 #include <net/if.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include <linux/can.h>
-#include <linux/can/raw.h>
 
-#define PROGNAME "socketcan-raw-demo"
-#define VERSION  "1.0.0"
+#define VERSION "2.0.0"
 
 #define MSGID (0x0CC)
 
-#define DELAY (10000)
-
-static sig_atomic_t sigval;
-
-static void onsig(int val)
+struct args
 {
-    sigval = (sig_atomic_t)val;
+    const char *iface;
+};
+
+static volatile sig_atomic_t run = 1;
+
+static void on_signal(int)
+{
+    run = 0;
 }
 
-static void usage(void)
+static void init_signals(void)
 {
-    puts("Usage: " PROGNAME "[OPTIONS] IFACE\n"
-         "Where:\n"
-         "  IFACE    CAN network interface\n"
-         "Options:\n"
-         "  -h       Display this help then exit\n"
-         "  -v       Display version info then exit\n");
+    struct sigaction sa;
+    sa.sa_handler = on_signal;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 }
 
-static void version(void)
+static int init_socket(const char *iface)
 {
-    puts(PROGNAME " " VERSION "\n");
+    struct sockaddr_can addr;
+    struct ifreq ifr;
+    int sfd;
+    int rc;
+
+    /* Create a raw CAN socket */
+    sfd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (-1 == sfd) {
+        error(EXIT_FAILURE, errno, "socket");
+    }
+
+    /* Determine the interface index */
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
+    rc = ioctl(sfd, SIOCGIFINDEX, &ifr);
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "ioctl");
+    }
+
+    /* Set the local address to bind to */
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+
+    /* Bind the address to the socket */
+    rc = bind(sfd, (struct sockaddr *)&addr, sizeof(addr));
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "bind");
+    }
+
+    return sfd;
+}
+
+static void cleanup(int sfd)
+{
+    sigset_t mask;
+    int rc;
+
+    /* Block signals from interfering with graceful shutdown */
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    /* Close the socket */
+    rc = close(sfd);
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "close");
+    }
+}
+
+static void print_help(const char *progname)
+{
+    printf(
+        "Usage: %s [OPTIONS] IFACE\n"
+        "\n"
+        "Arguments:\n"
+        "  IFACE    CAN network interface (e.g. can0)\n"
+        "\n"
+        "Options:\n"
+        "  --help, -h       Display this help then exit\n"
+        "  --version, -V    Display version info then exit\n",
+        progname
+    );
+}
+
+static void print_version(void)
+{
+    puts(VERSION);
+}
+
+static void print_can_frame(const struct can_frame *const frame)
+{
+    const unsigned char *data = frame->data;
+    const unsigned char len = frame->len;
+    unsigned char i;
+
+    printf("%03X  [%u] ", frame->can_id, len);
+    for (i = 0; i < len; i++) {
+        printf(" %02X", data[i]);
+    }
+}
+
+static void parse_args(int argc, char **argv, struct args *args)
+{
+    const char *progname = program_invocation_short_name;
+
+    static const struct option long_options[] = {
+        {"help", no_argument, NULL, 'h'},
+        {"version", no_argument, NULL, 'V'},
+        {0, 0, 0, 0}
+    };
+
+    for (;;) {
+        const int opt = getopt_long(argc, argv, "Vh", long_options, NULL);
+        if (opt == -1) {
+            break;
+        }
+
+        switch (opt) {
+        case 'V':
+            print_version();
+            exit(EXIT_SUCCESS);
+        case 'h':
+            print_help(progname);
+            exit(EXIT_SUCCESS);
+        default:
+            print_help(progname);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if ((argc - optind) != 1) {
+        error(0, 0, "exactly one CAN interface argument expected");
+        print_help(progname);
+        exit(EXIT_FAILURE);
+    }
+
+    args->iface = argv[optind];
 }
 
 int main(int argc, char **argv)
 {
-    int flags, opt;
-    int s;
-    char *iface;
-    struct sockaddr_can addr;
-    struct ifreq ifr;
+    struct args args;
+    int sfd;
 
-    /* Check if at least one argument was specified */
-    if (argc < 2)
-    {
-        fputs("Too few arguments!\n", stderr);
-        usage();
-        return EXIT_FAILURE;
-    }
+    program_invocation_name = program_invocation_short_name;
 
-    /* Parse command line options */
-    while ((opt = getopt(argc, argv, "hv")) != -1)
-    {
-        switch (opt)
-        {
-        case 'h':
-            usage();
-            return EXIT_SUCCESS;
-        case 'v':
-            version();
-            return EXIT_SUCCESS;
-        default:
-            usage();
-            return EXIT_FAILURE;
-        }
-    }
+    parse_args(argc, argv, &args);
+    init_signals();
+    sfd = init_socket(args.iface);
 
-    /* Exactly one command line argument must remain; the interface to use */
-    if (optind == (argc - 1))
-    {
-        iface = argv[optind];
-    }
-    else
-    {
-        fputs("Only one interface may be used!\n", stderr);
-        usage();
-        return EXIT_FAILURE;
-    }
-
-    /* Register signal handlers */
-    if (signal(SIGINT, onsig)    == SIG_ERR ||
-        signal(SIGTERM, onsig)   == SIG_ERR ||
-        signal(SIGCHLD, SIG_IGN) == SIG_ERR)
-    {
-        perror(PROGNAME);
-        return errno;
-    }
-
-    /* Open the CAN interface */
-    s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (s < 0)
-    {
-        perror(PROGNAME ": socket");
-        return errno;
-    }
-
-    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
-    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0)
-    {
-        perror(PROGNAME ": ioctl");
-        return errno;
-    }
-
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        perror(PROGNAME ": bind");
-        return errno;
-    }
-
-    /* Set socket to non-blocking */
-    flags = fcntl(s, F_GETFL, 0);
-    if (flags < 0)
-    {
-        perror(PROGNAME ": fcntl: F_GETFL");
-        return errno;
-    }
-
-    if (fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
-    {
-        perror(PROGNAME ": fcntl: F_SETFL");
-        return errno;
-    }
-
-    /* Setup code */
-    sigval = 0;
-
-    /* Main loop */
-    while (0 == sigval)
-    {
+    while (run) {
         struct can_frame frame;
-        ssize_t nbytes;
+        unsigned char i;
+        ssize_t n;
 
-        /* Read from the CAN interface */
-        nbytes = read(s, &frame, sizeof(frame));
-        if (nbytes < 0)
-        {
-            if (errno != EAGAIN)
-            {
-                perror(PROGNAME ": read");
+        /* Read a frame from the CAN interface */
+        n = read(sfd, &frame, sizeof(frame));
+        if (-1 == n) {
+            if (EINTR == errno) {
+                continue;
             }
 
-            usleep(DELAY);
+            error(0, errno, "read");
+            break;
         }
-        else if (nbytes < (ssize_t)sizeof(frame))
-        {
-            fputs(PROGNAME ": read: incomplete CAN frame\n", stderr);
-            usleep(DELAY);
+
+        /* Print the received CAN frame */
+        printf("RX:  ");
+        print_can_frame(&frame);
+        printf("\n");
+
+        /* Modify the CAN frame to have our message ID */
+        frame.can_id = MSGID;
+
+        /* Increment the value of each byte in the CAN frame */
+        for (i = 0; i < frame.len; i++) {
+            frame.data[i] += 1;
         }
-        else
-        {
-            unsigned char * const data = frame.data;
-            const unsigned int dlc = frame.can_dlc;
-            unsigned int i;
 
-            /* Print the received CAN frame */
-            printf("RX:  ");
-            print_can_frame(&frame);
-            printf("\n");
-
-            /* Modify the CAN frame to use our message ID */
-            frame.can_id = MSGID;
-
-            /* Increment the value of each byte in the CAN frame */
-            for (i = 0; i < dlc; ++i)
-            {
-                data[i] += 1;
+        /* Write the modified frame back out to the bus */
+        n = write(sfd, &frame, sizeof(frame));
+        if (-1 == n) {
+            if (EINTR == errno) {
+                continue;
             }
 
-            /* Write the modified frame back out to the bus */
-            nbytes = write(s, &frame, sizeof(frame));
-            if (nbytes < 0)
-            {
-                perror(PROGNAME ": write");
-            }
-            else if (nbytes < (ssize_t)sizeof(frame))
-            {
-                fputs(PROGNAME ": write: incomplete CAN frame\n", stderr);
-            }
-            else
-            {
-                /* Print the transmitted CAN frame */
-                printf("TX:  ");
-                print_can_frame(&frame);
-                printf("\n");
-            }
+            error(0, errno, "write");
+            break;
         }
+
+        /* Print the transmitted CAN frame */
+        printf("TX:  ");
+        print_can_frame(&frame);
+        printf("\n");
     }
 
-    puts("\nGoodbye!");
-
-    /* Close the CAN interface */
-    if (close(s) < 0)
-    {
-        perror(PROGNAME ": close");
-        return errno;
-    }
-
+    cleanup(sfd);
+    puts("Goodbye!");
     return EXIT_SUCCESS;
 }
-

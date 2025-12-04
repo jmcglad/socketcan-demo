@@ -1,42 +1,32 @@
-TARGETS=socketcan-raw-demo socketcan-bcm-demo socketcan-cyclic-demo
-SRCDIR=src
+TARGETS = socketcan-raw-demo socketcan-bcm-demo socketcan-cyclic-demo
 
 # Compiler setup
-CC=gcc
-CPPFLAGS=-Isrc
-CFLAGS=-std=gnu11 -pedantic -Wall -Wextra
-LIBS=
+# Note, the code depends on glibc
+CC = gcc
+CPPFLAGS = -D_GNU_SOURCE
+CFLAGS = -std=gnu17 -Wall -Wextra
 
-# Programs
-RM=rm -f
-
+#
 # Rules
-.PHONY: all debug clean rebuild
+#
 
-all: CPPFLAGS+=-DNDEBUG
-all: CFLAGS+=-O3
+.PHONY: all debug clean
+
+all: CPPFLAGS += -DNDEBUG
+all: CFLAGS += -O2
 all: $(TARGETS)
 
-debug: CFLAGS+=-g
+debug: CFLAGS += -g
 debug: $(TARGETS)
 
-socketcan-raw-demo: $(SRCDIR)/socketcan-raw-demo.o $(SRCDIR)/util.o
-	$(CC) -o $@ $^ $(LIBS)
+socketcan-raw-demo: socketcan-raw-demo.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^
 
-socketcan-bcm-demo: $(SRCDIR)/socketcan-bcm-demo.o $(SRCDIR)/util.o
-	$(CC) -o $@ $^ $(LIBS)
+socketcan-bcm-demo: socketcan-bcm-demo.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^
 
-socketcan-cyclic-demo: $(SRCDIR)/socketcan-cyclic-demo.o
-	$(CC) -o $@ $^ $(LIBS)
-
-%.o: %.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+socketcan-cyclic-demo: socketcan-cyclic-demo.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^
 
 clean:
-	$(RM) $(SRCDIR)/*.o
-	$(RM) socketcan-raw-demo
-	$(RM) socketcan-bcm-demo
-	$(RM) socketcan-cyclic-demo
-
-rebuild: clean all
-
+	$(RM) $(TARGETS)

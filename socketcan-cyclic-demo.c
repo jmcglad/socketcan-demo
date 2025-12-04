@@ -25,11 +25,11 @@ THE SOFTWARE.
 
 Broadcast Manager Cyclic Demo
 
-This program demonstrates sending a set of cyclic messages out on to the CAN
-bus using SocketCAN's Broadcast Manager interface. The intended behavior of
-this program is to send four cyclic messages out on to the CAN bus. These
-messages have IDs ranging from 0x0C0 to 0x0C3. These messages will be sent out
-one at a time every 1200 milliseconds. Once all messages have been sent,
+This program demonstrates sending a set of cyclic messages out to the CAN bus
+using SocketCAN's broadcast manager interface. The intended behavior of this
+program is to send four cyclic messages out to the CAN bus. These messages
+have IDs ranging from 0x0C0 to 0x0C3. These messages will be sent out one at
+a time every 1200 milliseconds. Once all messages have been sent,
 transmission will begin again with message 0x0C0.
 */
 
@@ -40,184 +40,221 @@ transmission will begin again with message 0x0C0.
 #include <string.h>
 
 #include <unistd.h>
+#include <error.h>
+#include <getopt.h>
 #include <net/if.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include <linux/can.h>
 #include <linux/can/bcm.h>
 
-#define PROGNAME "socketcan-bcm-demo"
-#define VERSION  "1.0.0"
+#define VERSION  "2.0.0"
 
-#define MSGID   (0x0C0)
-#define MSGLEN  (3)
+#define MSGID (0x0C0)
+#define MSGLEN (3)
 #define NFRAMES (4)
 
-#define DELAY (10000)
-
-static sig_atomic_t sigval;
-
-static void onsig(int val)
+struct args
 {
-    sigval = (sig_atomic_t)val;
+    const char *iface;
+};
+
+static void on_signal(int)
+{
+    /* Do nothing.
+     * The only reason this handler exists is to make sure sigsuspend(2) returns.
+     */
 }
 
-static void usage(void)
+static void init_signals(void)
 {
-    puts("Usage: " PROGNAME "[OPTIONS] IFACE\n"
-         "Where:\n"
-         "  IFACE    CAN network interface\n"
-         "Options:\n"
-         "  -h       Display this help then exit\n"
-         "  -v       Display version info then exit\n");
+    struct sigaction sa;
+    sa.sa_handler = on_signal;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 }
 
-static void version(void)
+static int init_socket(const char *iface)
 {
-    puts(PROGNAME " " VERSION "\n");
+    struct sockaddr_can addr;
+    struct ifreq ifr;
+    int sfd;
+    int rc;
+
+    /* Create a broadcast manager CAN socket */
+    sfd = socket(PF_CAN, SOCK_DGRAM, CAN_BCM);
+    if (-1 == sfd) {
+        error(EXIT_FAILURE, errno, "socket");
+    }
+
+    /* Determine the interface index */
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
+    rc = ioctl(sfd, SIOCGIFINDEX, &ifr);
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "ioctl");
+    }
+
+    /* Set the local address to connect to */
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+
+    /* Connect the socket to the address */
+    rc = connect(sfd, (struct sockaddr *)&addr, sizeof(addr));
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "bind");
+    }
+
+    return sfd;
+}
+
+static void cleanup(int sfd)
+{
+    sigset_t mask;
+    int rc;
+
+    /* Block signals from interfering with graceful shutdown */
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    /* Close the socket */
+    rc = close(sfd);
+    if (-1 == rc) {
+        error(EXIT_FAILURE, errno, "close");
+    }
+}
+
+static void print_help(const char *progname)
+{
+    printf(
+        "Usage: %s [OPTIONS] IFACE\n"
+        "\n"
+        "Arguments:\n"
+        "  IFACE    CAN network interface (e.g. can0)\n"
+        "\n"
+        "Options:\n"
+        "  --help, -h       Display this help then exit\n"
+        "  --version, -V    Display version info then exit\n",
+        progname
+    );
+}
+
+static void print_version(void)
+{
+    puts(VERSION);
+}
+
+static void parse_args(int argc, char **argv, struct args *args)
+{
+    const char *progname = program_invocation_short_name;
+
+    static const struct option long_options[] = {
+        {"help", no_argument, NULL, 'h'},
+        {"version", no_argument, NULL, 'V'},
+        {0, 0, 0, 0}
+    };
+
+    for (;;) {
+        const int opt = getopt_long(argc, argv, "Vh", long_options, NULL);
+        if (opt == -1) {
+            break;
+        }
+
+        switch (opt) {
+        case 'V':
+            print_version();
+            exit(EXIT_SUCCESS);
+        case 'h':
+            print_help(progname);
+            exit(EXIT_SUCCESS);
+        default:
+            print_help(progname);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if ((argc - optind) != 1) {
+        error(0, 0, "exactly one CAN interface argument expected");
+        print_help(progname);
+        exit(EXIT_FAILURE);
+    }
+
+    args->iface = argv[optind];
 }
 
 int main(int argc, char **argv)
 {
-    unsigned int i;
-    int opt;
-    int s;
-    char *iface;
-    struct sockaddr_can addr;
-    struct ifreq ifr;
-    
+    struct args args;
+    sigset_t mask;
+    ssize_t n;
+    int sfd;
+    int i;
+
     struct can_msg
     {
         struct bcm_msg_head msg_head;
-        struct can_frame frame[NFRAMES];
+        struct can_frame frames[NFRAMES];
     } msg;
 
-    /* Check if at least one argument was specified */
-    if (argc < 2)
-    {
-        fputs("Too few arguments!\n", stderr);
-        usage();
-        return EXIT_FAILURE;
-    }
+    program_invocation_name = program_invocation_short_name;
 
-    /* Parse command line options */
-    while ((opt = getopt(argc, argv, "hv")) != -1)
-    {
-        switch (opt)
-        {
-        case 'h':
-            usage();
-            return EXIT_SUCCESS;
-        case 'v':
-            version();
-            return EXIT_SUCCESS;
-        default:
-            usage();
-            return EXIT_FAILURE;
-        }
-    }
+    parse_args(argc, argv, &args);
+    init_signals();
+    sfd = init_socket(args.iface);
 
-    /* Exactly one command line argument must remain; the interface to use */
-    if (optind == (argc - 1))
-    {
-        iface = argv[optind];
-    }
-    else
-    {
-        fputs("Only one interface may be used!\n", stderr);
-        usage();
-        return EXIT_FAILURE;
-    }
-
-    /* Register signal handlers */
-    if (signal(SIGINT, onsig)    == SIG_ERR ||
-        signal(SIGTERM, onsig)   == SIG_ERR ||
-        signal(SIGCHLD, SIG_IGN) == SIG_ERR)
-    {
-        perror(PROGNAME);
-        return errno;
-    }
-
-    /* Open the CAN interface */
-    s = socket(PF_CAN, SOCK_DGRAM, CAN_BCM);
-    if (s < 0)
-    {
-        perror(PROGNAME ": socket");
-        return errno;
-    }
-
-    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
-    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0)
-    {
-        perror(PROGNAME ": ioctl");
-        return errno;
-    }
-
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        perror(PROGNAME ": connect");
-        return errno;
-    }
-
-    /* Setup code */
-    sigval = 0;
-
-    /* Set up cyclic messages. Note that both SETTIMER and STARTTIMER are
-     * required as flags in order to continue transmitting.
-     */
-    msg.msg_head.opcode  = TX_SETUP;
-    msg.msg_head.can_id  = 0;
-    msg.msg_head.flags   = SETTIMER | STARTTIMER;
+    /* Create cyclic transmission task */
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_head.opcode = TX_SETUP;
+    msg.msg_head.can_id = 0;
+    msg.msg_head.flags = SETTIMER | STARTTIMER;
     msg.msg_head.nframes = NFRAMES;
-    msg.msg_head.count   = 0;
+    msg.msg_head.count = 0;
 
-    /* Set the time interval value to 1200 ms */
+    /* Set the time interval for sending messages to 1200ms */
     msg.msg_head.ival2.tv_sec = 1;
     msg.msg_head.ival2.tv_usec = 200000;
 
-    /* Create the example messages */
-    for (i = 0; i < NFRAMES; ++i)
-    {
-        struct can_frame * const frame = msg.frame + i;
+    /* Set the example messages */
+    for (i = 0; i < NFRAMES; i++) {
+        struct can_frame *frame = &msg.frames[i];
         frame->can_id = MSGID + i;
-        frame->can_dlc = MSGLEN;
+        frame->len = MSGLEN;
         memset(frame->data, i, MSGLEN);
     }
 
-    /* Register the cyclic messages. Note that all of the messages in the msg
-     * struct will be sent with the same periodicity because they share the
-     * same bcm_msg_head setup data.
+    /* Register the cyclic messages and begin transmitting immediately.
+     * Note, all of the messages will be sent with the same periodicity
+     * because they share the same bcm_msg_head setup.
      */
-    if (write(s, &msg, sizeof(msg)) < 0)
-    {
-        perror(PROGNAME ": write: TX_SETUP");
-        return errno;
+    n = write(sfd, &msg, sizeof(msg));
+    if (-1 == n) {
+        error(EXIT_FAILURE, errno, "write");
     }
 
-    printf("Cyclic messages registed with SocketCAN!\n"
-           "Use a tool such as \"candump %s\" to view the messages.\n"
-           "These messages will continue to transmit so long as the socket\n"
-           "used to communicate with SocketCAN remains open. In other words,\n"
-           "close this program with SIGINT or SIGTERM in order to gracefully\n"
-           "stop transmitting.\n",
-           iface);
+    printf(
+        "Cyclic messages registed with SocketCAN!\n"
+        "Use a tool such as \"candump %s\" to view the messages.\n"
+        "These messages will continue to transmit so long as the socket\n"
+        "used to communicate with SocketCAN remains open. In other words,\n"
+        "close this program with SIGINT or SIGTERM in order to gracefully\n"
+        "stop transmitting.\n",
+        args.iface
+    );
 
-    /* Spin forever here */
-    while (0 == sigval) usleep(DELAY);
+    /* Suspend this thread until SIGINT or SIGTERM is received.
+     * The cyclic CAN messages will continue to be transmitted by the kernel.
+     */
+    sigfillset(&mask);
+    sigdelset(&mask, SIGINT);
+    sigdelset(&mask, SIGTERM);
+    sigsuspend(&mask);
 
-    puts("\nGoodbye!");
-
-    /* Close the CAN interface */
-    if (close(s) < 0)
-    {
-        perror(PROGNAME ": close");
-        return errno;
-    }
-
+    cleanup(sfd);
+    puts("Goodbye!");
     return EXIT_SUCCESS;
 }
-
